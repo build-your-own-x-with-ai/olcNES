@@ -51,28 +51,38 @@
 
 	Author
 	~~~~~~
-	David Barr, aka javidx9, �OneLoneCoder 2019
+	David Barr, aka javidx9, �OneLoneCoder 2019
 */
 
 #include <iostream>
 #include <sstream>
 #include <deque>
+#include <vector>
 
 #include "Bus.h"
 
 #define OLC_PGE_APPLICATION
 #include "olcPixelGameEngine.h"
 
-#define OLC_PGEX_SOUND
-#include "olcPGEX_Sound.h"
+// OpenAL for macOS audio support
+#ifdef __APPLE__
+#include <OpenAL/al.h>
+#include <OpenAL/alc.h>
+#else
+#include <AL/al.h>
+#include <AL/alc.h>
+#endif
 
 
 class Demo_olcNES : public olc::PixelGameEngine
 {
 public:
 	Demo_olcNES() { sAppName = "olcNES Sound Demonstration"; }
+	Demo_olcNES(const std::string& romPath) : sRomPath(romPath) { sAppName = "olcNES Sound Demonstration"; }
 
-private: 
+private:
+	std::string sRomPath = "./nestest.nes";
+
 	// The NES
 	Bus nes;
 	std::shared_ptr<Cartridge> cart;
@@ -83,6 +93,17 @@ private:
 
 	std::list<uint16_t> audio[4];
 	float fAccumulatedTime = 0.0f;
+
+	// OpenAL audio members
+	ALCdevice* al_device = nullptr;
+	ALCcontext* al_context = nullptr;
+	ALuint al_source = 0;
+	int al_status = 0;
+	std::vector<uint8_t> audio_buffer;
+
+	// Audio sampling control
+	int audio_sample_counter = 0;
+	const int audio_sample_interval = 120; // Sample every N clocks to get ~735 samples per frame (29780 clocks / 735 ≈ 40, but adjust for actual)
 
 private: 
 	// Support Utilities
@@ -174,67 +195,68 @@ private:
 		}
 	}
 
-	// This function is called by the underlying sound hardware
-	// which runs in a different thread. It is automatically
-	// synchronised with the sample rate of the sound card, and
-	// expects a single "sample" to be returned, whcih ultimately
-	// makes its way to your speakers, and then your ears, for that
-	// lovely 8-bit bliss... but, that means we've some thread
-	// handling to deal with, since we want both the PGE thread
-	// and the sound system thread to interact with the emulator.
-
-	static Demo_olcNES* pInstance; // Static variable that will hold a pointer to "this"
-
-	static float SoundOut(int nChannel, float fGlobalTime, float fTimeStep)
-	{
-		if (nChannel == 0)
-		{
-			while (!pInstance->nes.clock()) {};
-			return static_cast<float>(pInstance->nes.dAudioSample);
-		}
-		else
-			return 0.0f;
-	}
-
 	bool OnUserCreate() override
 	{
 		// Load the cartridge
-		cart = std::make_shared<Cartridge>("../nestest.nes");
-		
+		cart = std::make_shared<Cartridge>(sRomPath);
+
 		if (!cart->ImageValid())
 			return false;
 
 		// Insert into NES
 		nes.insertCartridge(cart);
-					
+
 		// Extract dissassembly
 		//mapAsm = nes.cpu.disassemble(0x0000, 0xFFFF);
 
-		
-
 		for (int i = 0; i < 4; i++)
-		{			
+		{
 			for (int j = 0; j < 120; j++)
 				audio[i].push_back(0);
 		}
-		
+
 		// Reset NES
 		nes.reset();
 
-		// Initialise PGEX sound system, and give it a function to 
-		// call which returns a sound sample on demand
-		pInstance = this;
+		// Initialize OpenAL for real NES audio
+		std::cout << "🎵 Initializing OpenAL audio..." << std::endl;
+		al_device = alcOpenDevice(NULL);
+
+		if (!al_device) {
+			std::cout << "⚠️  Failed to open OpenAL device, running in silent mode" << std::endl;
+		} else {
+			al_context = alcCreateContext(al_device, NULL);
+			if (!al_context) {
+				std::cout << "⚠️  Failed to create OpenAL context" << std::endl;
+				alcCloseDevice(al_device);
+				al_device = nullptr;
+			} else {
+				alcMakeContextCurrent(al_context);
+				alGenSources(1, &al_source);
+				al_status = 0;
+				std::cout << "✓ OpenAL audio initialized successfully!" << std::endl;
+			}
+		}
+
+		// Set audio sample frequency
 		nes.SetSampleFrequency(44100);
-		olc::SOUND::InitialiseAudio(44100, 1, 8, 512);
-		olc::SOUND::SetUserSynthFunction(SoundOut);
+
 		return true;
 	}
 
-	// We must play nicely now with the sound hardware, so unload
-	// it when the application terminates
+	// Clean up OpenAL resources
 	bool OnUserDestroy() override
 	{
-		olc::SOUND::DestroyAudio();
+		if (al_source) {
+			alDeleteSources(1, &al_source);
+		}
+		if (al_context) {
+			alcMakeContextCurrent(NULL);
+			alcDestroyContext(al_context);
+		}
+		if (al_device) {
+			alcCloseDevice(al_device);
+		}
 		return true;
 	}
 
@@ -242,6 +264,49 @@ private:
 	{
 		EmulatorUpdateWithAudio(fElapsedTime);
 		return true;
+	}
+
+	// Submit audio samples to OpenAL
+	void SubmitAudioToOpenAL()
+	{
+		if (!al_device || !al_source) return;
+		if (audio_buffer.empty()) return;
+
+		// Create and fill OpenAL buffer with accumulated samples
+		ALuint buffer;
+		alGenBuffers(1, &buffer);
+		alBufferData(buffer, AL_FORMAT_MONO8,
+					audio_buffer.data(), audio_buffer.size(), 44100);
+		alSourceQueueBuffers(al_source, 1, &buffer);
+
+		// Clean up processed buffers to prevent memory leak
+		ALint processed;
+		alGetSourcei(al_source, AL_BUFFERS_PROCESSED, &processed);
+		if (processed > 0) {
+			ALuint processed_buffers[16];
+			int to_unqueue = (processed > 16) ? 16 : processed;
+			alSourceUnqueueBuffers(al_source, to_unqueue, processed_buffers);
+			alDeleteBuffers(to_unqueue, processed_buffers);
+		}
+
+		// Manage playback state based on buffer queue depth
+		ALint queued;
+		alGetSourcei(al_source, AL_BUFFERS_QUEUED, &queued);
+
+		// Start playing when we have enough buffered audio
+		if (queued >= 3 && al_status == 0) {
+			al_status = 1;
+			alSourcePlay(al_source);
+			std::cout << "🎵 Audio playback started (queue: " << queued << ", samples: " << audio_buffer.size() << ")" << std::endl;
+		}
+		// Pause if queue is too shallow to prevent crackling
+		else if (queued <= 1 && al_status == 1) {
+			al_status = 0;
+			alSourcePause(al_source);
+			std::cout << "⏸️  Audio paused (queue: " << queued << ")" << std::endl;
+		}
+
+		audio_buffer.clear();
 	}
 
 	// This performs an emulation update but synced to audio, so it cant
@@ -263,6 +328,33 @@ private:
 			audio[2].push_back(nes.apu.noise_visual);
 		}
 
+		// Run emulation for one frame
+		if (fResidualTime > 0.0f)
+			fResidualTime -= fElapsedTime;
+		else
+		{
+			fResidualTime += (1.0f / 60.0f) - fElapsedTime;
+
+			// Accumulate audio samples during frame execution
+			do {
+				nes.clock();
+
+				// Sample audio at correct rate (~735 samples per frame)
+				audio_sample_counter++;
+				if (audio_sample_counter >= audio_sample_interval) {
+					audio_sample_counter = 0;
+					double audio_sample = nes.dAudioSample;
+					if (audio_sample < -1.0) audio_sample = -1.0;
+					if (audio_sample > 1.0) audio_sample = 1.0;
+					uint8_t sample = static_cast<uint8_t>((audio_sample + 1.0) * 127.5);
+					audio_buffer.push_back(sample);
+				}
+			} while (!nes.ppu.frame_complete);
+			nes.ppu.frame_complete = false;
+
+			// Submit accumulated audio after frame completes
+			SubmitAudioToOpenAL();
+		}
 
 		Clear(olc::DARK_BLUE);
 
@@ -317,103 +409,23 @@ private:
 		DrawSprite(0, 0, &nes.ppu.GetScreen(), 2);
 		return true;
 	}
-
-	// This performs emulation with no audio synchronisation, so it is just
-	// as before, in all the previous videos
-	bool EmulatorUpdateWithoutAudio(float fElapsedTime)
-	{
-		Clear(olc::DARK_BLUE);
-
-		// Handle input for controller in port #1
-		nes.controller[0] = 0x00;
-		nes.controller[0] |= GetKey(olc::Key::X).bHeld ? 0x80 : 0x00;     // A Button
-		nes.controller[0] |= GetKey(olc::Key::Z).bHeld ? 0x40 : 0x00;     // B Button
-		nes.controller[0] |= GetKey(olc::Key::A).bHeld ? 0x20 : 0x00;     // Select
-		nes.controller[0] |= GetKey(olc::Key::S).bHeld ? 0x10 : 0x00;     // Start
-		nes.controller[0] |= GetKey(olc::Key::UP).bHeld ? 0x08 : 0x00;
-		nes.controller[0] |= GetKey(olc::Key::DOWN).bHeld ? 0x04 : 0x00;
-		nes.controller[0] |= GetKey(olc::Key::LEFT).bHeld ? 0x02 : 0x00;
-		nes.controller[0] |= GetKey(olc::Key::RIGHT).bHeld ? 0x01 : 0x00;
-
-		if (GetKey(olc::Key::SPACE).bPressed) bEmulationRun = !bEmulationRun;
-		if (GetKey(olc::Key::R).bPressed) nes.reset();
-		if (GetKey(olc::Key::P).bPressed) (++nSelectedPalette) &= 0x07;
-
-		if (bEmulationRun)
-		{
-			if (fResidualTime > 0.0f)
-				fResidualTime -= fElapsedTime;
-			else
-			{
-				fResidualTime += (1.0f / 60.0f) - fElapsedTime;
-				do { nes.clock(); } while (!nes.ppu.frame_complete);
-				nes.ppu.frame_complete = false;
-			}
-		}
-		else
-		{
-			// Emulate code step-by-step
-			if (GetKey(olc::Key::C).bPressed)
-			{
-				// Clock enough times to execute a whole CPU instruction
-				do { nes.clock(); } while (!nes.cpu.complete());
-				// CPU clock runs slower than system clock, so it may be
-				// complete for additional system clock cycles. Drain
-				// those out
-				do { nes.clock(); } while (nes.cpu.complete());
-			}
-
-			// Emulate one whole frame
-			if (GetKey(olc::Key::F).bPressed)
-			{
-				// Clock enough times to draw a single frame
-				do { nes.clock(); } while (!nes.ppu.frame_complete);
-				// Use residual clock cycles to complete current instruction
-				do { nes.clock(); } while (!nes.cpu.complete());
-				// Reset frame completion flag
-				nes.ppu.frame_complete = false;
-			}
-		}
-
-		DrawCpu(516, 2);
-		//DrawCode(516, 72, 26);
-
-		// Draw OAM Contents (first 26 out of 64) ======================================
-		/*for (int i = 0; i < 26; i++)
-		{
-			std::string s = hex(i, 2) + ": (" + std::to_string(nes.ppu.pOAM[i * 4 + 3])
-				+ ", " + std::to_string(nes.ppu.pOAM[i * 4 + 0]) + ") "
-				+ "ID: " + hex(nes.ppu.pOAM[i * 4 + 1], 2) +
-				+" AT: " + hex(nes.ppu.pOAM[i * 4 + 2], 2);
-			DrawString(516, 72 + i * 10, s);
-		}*/
-
-		// Draw Palettes & Pattern Tables ==============================================
-		const int nSwatchSize = 6;
-		for (int p = 0; p < 8; p++) // For each palette
-			for (int s = 0; s < 4; s++) // For each index
-				FillRect(516 + p * (nSwatchSize * 5) + s * nSwatchSize, 340,
-					nSwatchSize, nSwatchSize, nes.ppu.GetColourFromPaletteRam(p, s));
-
-		// Draw selection reticule around selected palette
-		DrawRect(516 + nSelectedPalette * (nSwatchSize * 5) - 1, 339, (nSwatchSize * 4), nSwatchSize, olc::WHITE);
-
-		// Generate Pattern Tables
-		DrawSprite(516, 348, &nes.ppu.GetPatternTable(0, nSelectedPalette));
-		DrawSprite(648, 348, &nes.ppu.GetPatternTable(1, nSelectedPalette));
-
-		// Draw rendered output ========================================================
-		DrawSprite(0, 0, &nes.ppu.GetScreen(), 2);
-		return true;
-	}
 };
 
-// Provide implementation for our static pointer
-Demo_olcNES* Demo_olcNES::pInstance = nullptr;
-
-int main()
+int main(int argc, char* argv[])
 {
-	Demo_olcNES demo;
+	// Check for ROM path argument
+	std::string romPath = "./nestest.nes"; // Default ROM path
+	if (argc > 1)
+	{
+		romPath = argv[1];
+	}
+	else
+	{
+		std::cout << "Usage: " << argv[0] << " <path/to/rom.nes>" << std::endl;
+		std::cout << "Using default ROM: " << romPath << std::endl;
+	}
+
+	Demo_olcNES demo(romPath);
 	demo.Construct(780, 480, 2, 2);
 	demo.Start();
 	return 0;
